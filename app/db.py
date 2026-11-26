@@ -165,6 +165,106 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_audit_aggregate
     ON audit_events(aggregate_type, aggregate_id, id);
+
+-- ---------------------------------------------------------------------------
+-- Collaborative proofreading (校稿).  Draft text lives only in these tables;
+-- ``segments.content`` remains the official body until a publish transaction
+-- atomically updates it.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS proofreading_sessions (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('open', 'published')),
+    current_version INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL DEFAULT 'project-owner',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    published_version INTEGER,
+    published_at TEXT
+);
+
+-- At most one open proofreading session per interview.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_proofreading_one_open_per_interview
+    ON proofreading_sessions(interview_id) WHERE status = 'open';
+
+CREATE TABLE IF NOT EXISTS proofreading_session_segments (
+    session_id TEXT NOT NULL REFERENCES proofreading_sessions(id) ON DELETE CASCADE,
+    segment_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY (session_id, segment_id)
+);
+
+CREATE TABLE IF NOT EXISTS proofreading_versions (
+    session_id TEXT NOT NULL REFERENCES proofreading_sessions(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    submission_id TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, version)
+);
+
+-- Full draft snapshot for every selected segment at every version.  Text here
+-- is removed when the underlying segment body is physically purged.
+CREATE TABLE IF NOT EXISTS proofreading_segment_contents (
+    session_id TEXT NOT NULL REFERENCES proofreading_sessions(id) ON DELETE CASCADE,
+    segment_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    PRIMARY KEY (session_id, segment_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_proofreading_contents_segment
+    ON proofreading_segment_contents(segment_id);
+
+-- Actual applied edit operations.  Rows are stored in the coordinate space of
+-- version-1, so later proposals can be rebased through the real change
+-- history (not merely a diff of the current text).
+CREATE TABLE IF NOT EXISTS proofreading_edits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES proofreading_sessions(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    segment_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    start_pos INTEGER NOT NULL,
+    end_pos INTEGER NOT NULL,
+    replacement_text TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_proofreading_edits_version
+    ON proofreading_edits(session_id, version, segment_id);
+
+-- Submission idempotency records.  Only a payload fingerprint is stored, never
+-- the proposal text, so deletion cleanup needs to remove no content here.
+CREATE TABLE IF NOT EXISTS proofreading_submissions (
+    session_id TEXT NOT NULL REFERENCES proofreading_sessions(id) ON DELETE CASCADE,
+    submission_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('merged', 'rejected')),
+    base_version INTEGER NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, submission_id)
+);
+
+CREATE TABLE IF NOT EXISTS proofreading_annotations (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES proofreading_sessions(id) ON DELETE CASCADE,
+    segment_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    start_pos INTEGER,
+    end_pos INTEGER,
+    anchored INTEGER NOT NULL DEFAULT 1,
+    resolved INTEGER NOT NULL DEFAULT 0,
+    anchor_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_proofreading_annotations_session
+    ON proofreading_annotations(session_id, resolved, anchored);
+CREATE INDEX IF NOT EXISTS idx_proofreading_annotations_segment
+    ON proofreading_annotations(segment_id);
 """
 
 

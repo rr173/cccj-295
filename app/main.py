@@ -11,13 +11,18 @@ from typing import Annotated, Literal
 from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import services
+from . import proofreading, services
 from .db import connect, init_db
 from .schemas import (
     ExportCreate,
     InterviewCreate,
     ParticipantCreate,
     ProfileUpdate,
+    ProofreadingAnnotationCreate,
+    ProofreadingAnnotationReanchor,
+    ProofreadingProposal,
+    ProofreadingPublish,
+    ProofreadingSessionCreate,
     RetentionCreate,
     RetentionRelease,
     SegmentCreate,
@@ -322,3 +327,155 @@ def owner_list_deletion_requests(db=Depends(get_db), owner: Owner = None):
 @app.get("/owner/audit-events")
 def owner_audit_events(limit: int = Query(default=200, ge=1, le=1000), db=Depends(get_db), owner: Owner = None):
     return {"events": services.list_audit_events(db, limit=limit)}
+
+
+# ---------------------------------------------------------------------------
+# Collaborative proofreading (校稿).  Every route uses the existing owner
+# credential.  Draft text is never visible through ordinary read/search/export
+# entries until it is published into segments.content.
+# ---------------------------------------------------------------------------
+
+
+@app.post("/owner/proofreading/sessions", status_code=201)
+def open_proofreading_session(
+    body: ProofreadingSessionCreate, db=Depends(get_db), owner: Owner = None
+):
+    return proofreading.open_session(
+        db,
+        interview_id=body.interview_id,
+        segment_ids=body.segment_ids,
+        created_by=body.created_by,
+    )
+
+
+@app.get("/owner/proofreading/sessions")
+def list_proofreading_sessions(
+    db=Depends(get_db),
+    owner: Owner = None,
+    interview_id: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+):
+    return {
+        "sessions": proofreading.list_sessions(
+            db, interview_id=interview_id, status=status
+        )
+    }
+
+
+@app.get("/owner/proofreading/sessions/{session_id}")
+def get_proofreading_session(
+    session_id: str,
+    db=Depends(get_db),
+    owner: Owner = None,
+    version: int | None = Query(default=None, ge=1),
+):
+    return proofreading.session_detail(db, session_id, version=version)
+
+
+@app.get("/owner/proofreading/sessions/{session_id}/versions")
+def list_proofreading_versions(
+    session_id: str, db=Depends(get_db), owner: Owner = None
+):
+    return {"versions": proofreading.list_versions(db, session_id)}
+
+
+@app.get("/owner/proofreading/sessions/{session_id}/versions/{version}")
+def get_proofreading_version(
+    session_id: str, version: int, db=Depends(get_db), owner: Owner = None
+):
+    return proofreading.get_version_draft(db, session_id, version)
+
+
+@app.post("/owner/proofreading/sessions/{session_id}/proposals", status_code=201)
+def submit_proofreading_proposal(
+    session_id: str,
+    body: ProofreadingProposal,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    edits = [
+        {
+            "segment_id": e.segment_id,
+            "start": e.start,
+            "end": e.end,
+            "replacement": e.replacement,
+        }
+        for e in body.edits
+    ]
+    result = proofreading.submit_proposal(
+        db,
+        session_id,
+        submission_id=body.submission_id,
+        base_version=body.base_version,
+        edits=edits,
+    )
+    payload = dict(result)
+    payload["idempotent_replay"] = result.get("idempotent_replay", False)
+    return JSONResponse(
+        status_code=200 if payload["idempotent_replay"] else 201, content=payload
+    )
+
+
+@app.get("/owner/proofreading/sessions/{session_id}/annotations")
+def list_proofreading_annotations(
+    session_id: str,
+    db=Depends(get_db),
+    owner: Owner = None,
+    include_out_of_scope: bool = Query(default=False),
+):
+    return {
+        "annotations": proofreading.list_annotations(
+            db, session_id, include_out_of_scope=include_out_of_scope
+        )
+    }
+
+
+@app.post("/owner/proofreading/sessions/{session_id}/annotations", status_code=201)
+def create_proofreading_annotation(
+    session_id: str,
+    body: ProofreadingAnnotationCreate,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    return proofreading.create_annotation(
+        db,
+        session_id,
+        segment_id=body.segment_id,
+        start=body.start,
+        end=body.end,
+        text=body.text,
+    )
+
+
+@app.post(
+    "/owner/proofreading/sessions/{session_id}/annotations/{annotation_id}/reanchor"
+)
+def reanchor_proofreading_annotation(
+    session_id: str,
+    annotation_id: str,
+    body: ProofreadingAnnotationReanchor,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    return proofreading.reanchor_annotation(
+        db, session_id, annotation_id, start=body.start, end=body.end
+    )
+
+
+@app.post(
+    "/owner/proofreading/sessions/{session_id}/annotations/{annotation_id}/resolve"
+)
+def resolve_proofreading_annotation(
+    session_id: str, annotation_id: str, db=Depends(get_db), owner: Owner = None
+):
+    return proofreading.resolve_annotation(db, session_id, annotation_id)
+
+
+@app.post("/owner/proofreading/sessions/{session_id}/publish")
+def publish_proofreading_session(
+    session_id: str,
+    body: ProofreadingPublish,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    return proofreading.publish(db, session_id, version=body.version)

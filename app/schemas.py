@@ -46,3 +46,46 @@ class ExportCreate(BaseModel):
     scope: Literal["all", "interview"] = "all"
     interview_id: str | None = None
     format: Literal["json", "markdown"] = "json"
+
+
+# ---------------------------------------------------------------------------
+# Collaborative proofreading (校稿)
+# ---------------------------------------------------------------------------
+
+
+class ProofreadingSessionCreate(BaseModel):
+    interview_id: str
+    segment_ids: list[str] = Field(
+        min_length=1,
+        description="Visible segments of this interview to include in proofreading",
+    )
+    created_by: str = "project-owner"
+
+
+class ProofreadingEdit(BaseModel):
+    segment_id: str
+    start: int = Field(ge=0, description="Zero-based Unicode code-point start (inclusive)")
+    end: int = Field(ge=0, description="Zero-based Unicode code-point end (exclusive)")
+    replacement: str = Field(default="", description="Empty string deletes the range")
+
+
+class ProofreadingProposal(BaseModel):
+    submission_id: str = Field(min_length=1, description="Caller-chosen idempotency ID for this proposal")
+    base_version: int = Field(ge=1, description="Draft version the ranges are interpreted against")
+    edits: list[ProofreadingEdit] = Field(min_length=1)
+
+
+class ProofreadingAnnotationCreate(BaseModel):
+    segment_id: str
+    start: int = Field(ge=0)
+    end: int = Field(ge=0)
+    text: str = Field(min_length=1)
+
+
+class ProofreadingAnnotationReanchor(BaseModel):
+    start: int = Field(ge=0)
+    end: int = Field(ge=0)
+
+
+class ProofreadingPublish(BaseModel):
+    version: int = Field(ge=1, description="Current draft version being published")

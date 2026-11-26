@@ -717,6 +717,11 @@ def _reconcile_segment_locked(conn: sqlite3.Connection, segment_id: str) -> dict
                 "INSERT OR IGNORE INTO segment_impact_index (segment_id, participant_id, first_seen_at) VALUES (?, ?, ?)",
                 (segment_id, pid, now),
             )
+        # Remove new-feature draft history, replacement text and annotation
+        # text for this segment in the *same* transaction as the body delete.
+        from .proofreading import remove_segment_content_locked
+
+        remove_segment_content_locked(conn, segment_id)
         # The segment row and content are physically deleted.  SQLite cascades
         # live segment_participants rows; segment_impact_index/deletion_items
         # remain and contain IDs/status only.
