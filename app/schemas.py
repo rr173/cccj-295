@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -89,3 +90,41 @@ class ProofreadingAnnotationReanchor(BaseModel):
 
 class ProofreadingPublish(BaseModel):
     version: int = Field(ge=1, description="Current draft version being published")
+
+
+# ---------------------------------------------------------------------------
+# Interview room booking and batch rescheduling (访谈预约 / 批量改期)
+# ---------------------------------------------------------------------------
+
+
+class RoomCreate(BaseModel):
+    id: str = Field(min_length=1, description="Caller-defined room identifier")
+    label: str = Field(min_length=1)
+
+
+class BookingCreate(BaseModel):
+    id: str | None = Field(default=None, description="Optional caller-defined booking ID")
+    interview_id: str
+    room_id: str
+    participant_ids: list[str] = Field(min_length=1)
+    start_at: datetime = Field(description="UTC inclusive start; timezone-aware required")
+    end_at: datetime = Field(description="UTC exclusive end; timezone-aware required")
+
+
+class RescheduleItemInput(BaseModel):
+    booking_id: str
+    room_id: str
+    start_at: datetime
+    end_at: datetime
+
+
+class RescheduleOrderCreate(BaseModel):
+    id: str | None = Field(default=None, description="Optional caller-defined order ID")
+    items: list[RescheduleItemInput] = Field(min_length=1)
+    consultation_deadline: datetime = Field(
+        description="UTC deadline; later than now and no later than every original/new start"
+    )
+
+
+class RescheduleResponseInput(BaseModel):
+    decision: Literal["accepted", "rejected"]

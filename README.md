@@ -297,7 +297,7 @@ PY
 | `GET /owner/audit-events` | 查看不含正文的状态/提交审计事件 |
 | `DELETE /sessions/{token}` / `DELETE /participants/{id}/session` | 撤销账号会话；不影响已提交清除事实 |
 
-协作校稿接口见第 6 节。
+协作校稿接口见第 6 节；访谈预约与批量改期接口见第 8 节。
 
 ## 6. 协作校稿（新增）
 
@@ -410,14 +410,105 @@ cd /workspace
 
 复跑结果（本仓库当前状态）：
 
-- `pytest -q`：**32 passed**；
+- `pytest -q`：**58 passed**；
 - `scripts/e2e_proofreading.py`：**61 项检查全部通过**；
 - `scripts/e2e_demo.py`（原有功能回归）：**62 项检查全部通过**。
 
 > 说明：本环境没有预装 `.venv`，可用 `python3 -m venv .venv` 后 `.venv/bin/pip install -r requirements.txt` 重建；若系统禁止 `ensurepip`，可用 `python3 -m pip --user --break-system-packages install -r requirements.txt` 后直接运行 `.venv/bin/python`（venv 用 `--system-site-packages` 创建即可）。
 
 
-## 7. 一致性设计要点
+## 8. 访谈预约与批量改期（新增）
+
+负责人在现有访谈之上登记**预约**（房间 + 参与者 + UTC 半开区间），并可对一组预约发起**批量改期征询**。征询期间原预约始终是确认结果；只有全部受影响参与者同意后，整套新安排才在一个事务里整体生效。
+
+### 8.1 数据与状态
+
+| 表 | 内容 |
+|---|---|
+| `rooms` | 会议室标识与名称 |
+| `bookings` | 预约：访谈、房间、UTC 起止时间、`confirmed/cancelled`；部分唯一索引保证每场访谈最多一条未取消预约 |
+| `booking_participants` | 预约的固定参与者名单（改期不改名单） |
+| `reschedule_orders` | 改期单：`pending/approved/rejected/withdrawn/expired/cancelled_booking` 与征询截止时间 |
+| `reschedule_items` | 单内每项的原房间/原时段与拟用房间/拟用时段 |
+| `reschedule_responses` | 每个参与者每单最多一条不可更改的首次答复 |
+
+### 8.2 接口
+
+负责人接口（`X-Owner-Token`）：
+
+| 方法/路径 | 用途 |
+|---|---|
+| `POST /owner/rooms` / `GET /owner/rooms` | 登记/列出会议室 |
+| `POST /owner/bookings` | 为现有访谈登记预约 |
+| `GET /owner/bookings` | 查看预约，可按 `status`/`room_id`/`interview_id` 过滤 |
+| `GET /owner/bookings/{id}` | 查看单条预约 |
+| `POST /owner/bookings/{id}/cancel?reason=` | 取消尚未开始的预约 |
+| `POST /owner/reschedule-orders` | 发起批量改期征询 |
+| `GET /owner/reschedule-orders` | 列出改期单，可按 `status` 过滤 |
+| `GET /owner/reschedule-orders/{id}` | 改期单详情（含每项、参与者与答复汇总） |
+| `POST /owner/reschedule-orders/{id}/withdraw` | 负责人撤回待答复征询 |
+| `POST /owner/reschedule-orders/sweep-expired` | 显式结算已到期征询（读路径也会惰性结算） |
+
+参与者接口（现有会话凭据，头 `X-Session-Token` 或 `Authorization: Bearer <token>`）：
+
+| 方法/路径 | 用途 |
+|---|---|
+| `GET /me/calendar` | 自己的确认预约 + 涉及自己的改期单及整单状态 |
+| `GET /me/reschedule-orders` | 涉及自己的改期单列表 |
+| `GET /me/reschedule-orders/{id}` | 单张涉及自己的改期单详情 |
+| `POST /me/reschedule-orders/{id}/responses` | 替自己答复 `accepted`/`rejected` |
+
+### 8.3 预约规则
+
+- 新预约必须**尚未开始**、`end_at > start_at`，且至少含一名有效（`active`）参与者；时间必须带时区（统一归一化为 UTC）。
+- 每场访谈最多一条未取消预约（`409 active_booking_exists`）。
+- 任一会议室或参与者在**相交**区间内不能被重复占用；区间为半开 `[start, end)`，首尾相接（一场 `end` 等于另一场 `start`）不算相交。
+- 只能取消尚未开始的确认预约（`409 booking_already_started`）。
+
+### 8.4 改期征询规则
+
+- 改期单指定一组**尚未开始的确认预约**、各自的新房间/新时段和征询截止时间；参与者名单不变。
+- 截止时间必须晚于当前时间，且**不晚于**任一原时段或新时段的开始（`422 deadline_must_be_future` / `deadline_too_late`）。
+- 每项至少改变房间或时段（`422 reschedule_item_unchanged`），单内预约不得重复。
+- 同一预约不能同时参加两张待答复单（`409 booking_in_other_pending_order`）。
+- 整套新安排必须**内部兼容**（同房间、同参与者均不得重叠），且不与单外确认预约或其它待答复单撞档；但可以使用同单其他预约**将让出**的原时段（见 8.6 的互换示例）。
+- 征询期间原安排仍是确认结果：**原时段与拟用时段都被持有**，单外预约既不能占用原时段，也不能占用拟用时段。
+
+### 8.5 答复、生效与失效
+
+- 参与者只能替自己答复；一人涉及多场也只在单上答复一次。首次有效答复不可更改：重复相同答复返回 `200` 且 `idempotent_replay=true`，改成相反答复返回 `409 response_already_recorded`。
+- 任一人拒绝（`rejected`）、负责人撤回（`withdrawn`）、到达截止时间（`expired`）或单内任一原预约被取消（`cancelled_booking`）都会结束征询：拟用时段立即释放，原预约保持不变。
+- **所有人同意**时，整套新安排在一个 `BEGIN IMMEDIATE` 事务里一次生效（`approved`），不再使用的原时段随即释放；答复重试不会再次改期，结束的单不能因迟到答复生效（`409 reschedule_not_pending`）。
+- 取消单内任一原预约只使整单失效，不挪动其余预约。
+
+### 8.6 与清除、会话和重启的关系
+
+- 参与者申请清除时，在**同一事务**内取消其尚未开始的预约，并使涉及这些预约的待答复征询失效（状态 `cancelled_booking`）；其余人的其它预约照常确认。
+- 会话失效（注销）本身**不**取消预约；已失效的会话不能再答复。
+- 截止时间在进程停机期间到达时，启动恢复（`recover_rescheduling`）会把单结算为 `expired`，拟用时段不再被占用；读路径和每次写操作也都会惰性结算到期单。
+
+### 8.7 复跑说明
+
+```bash
+cd /workspace
+
+# 单元/并发测试（含预约撞档、改期状态机、清除集成、重启恢复与线程竞争）
+.venv/bin/python -m pytest -q
+
+# 完整 HTTP 端到端验证（真实 uvicorn + 临时 SQLite + 真实重启）
+.venv/bin/python scripts/e2e_scheduling.py
+```
+
+`e2e_scheduling.py` 的三个重点场景：
+
+1. **原时段互换**：两场访谈在一张单里交换房间，征询期间原/拟时段都被占用，全员同意后一次换档；
+2. **征询失败后容量恢复**：拒绝后拟用房间时段立即可被新预约使用；
+3. **最终换档对日历查询的影响**：`GET /me/calendar` 在征询期间显示原安排，`approved` 后只显示新安排。
+
+最近一次运行结果：**46 项检查全部通过**。
+
+
+## 9. 一致性设计要点
 
 1. **普通隐藏谓词**：只要片段的任一参与者处于 `deletion_requested`，该片段就从普通 SQL 结果中排除。
 2. **执行时重读当前状态**：预览不持锁、不固化片段列表；执行事务重新查询，预览后新增且已提交的相关片段一定会进入任务。
@@ -430,5 +521,8 @@ cd /workspace
 9. **发布原子性**：一次发布在同一事务内改写所有可发布片段的正式正文；普通入口要么看到全部旧正文，要么看到全部新正文。
 10. **批注锚点不做猜测**：只有避开所指文字的改动才平移锚点；替换、删除或内部插入一律标记失位，需负责人显式重定位或解决。
 11. **清除与校稿同事务清理**：物理删除片段正文时，在同一事务中删除该片段的草稿历史、替换文字和批注文字，并清洗已存合入结果中的回显文本。
+12. **预约/改期全串行提交**：预约创建、取消、改期开单、答复、撤回和清除集成都在单个 `BEGIN IMMEDIATE` 事务内完成检查与写入；日历等多语句查询使用只读快照事务，因此任何查询都只能看到整旧或整新的安排，看不到只换了一部分的中间态。
+13. **征询期间双持有**：待答复改期单同时持有每项的原时段与拟用时段（房间维度和参与者维度），单外预约与其它待答复单都无法占用；同单项目可以复用同单将让出的时段，从而支持原时段互换。征询一旦终止（拒绝/撤回/到期/取消），拟用时段随状态翻转立即释放。
+14. **到期不靠定时器**：到期结算在每次写事务、读路径和启动恢复中惰性执行；停机期间到期的单在重启时结算为 `expired`，不会继续占用拟用时段。全员同意后的批量换档与改期单状态翻转共用同一事务提交。
 
 这是产品内约定的保留规则和演示级 owner token；若用于真实部署，应把 `require_owner` 替换为实际身份认证/授权，并评估 SQLite 文件层的安全删除与备份策略。

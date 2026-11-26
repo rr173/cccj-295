@@ -551,6 +551,16 @@ def create_deletion_request(
             (now, now, participant_id),
         )
 
+        # Cancel this participant's not-yet-started bookings in the same
+        # transaction and invalidate any pending consultations touching them.
+        # Other bookings keep their confirmed arrangement.  Imported locally to
+        # avoid a module import cycle (scheduling imports from this module).
+        from . import scheduling
+
+        booking_effect = scheduling.cancel_bookings_for_participant_purge_locked(
+            conn, participant_id, now=now
+        )
+
         live_segments = conn.execute(
             """
             SELECT s.id FROM segments s

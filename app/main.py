@@ -11,9 +11,10 @@ from typing import Annotated, Literal
 from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import proofreading, services
+from . import proofreading, scheduling, services
 from .db import connect, init_db
 from .schemas import (
+    BookingCreate,
     ExportCreate,
     InterviewCreate,
     ParticipantCreate,
@@ -23,8 +24,11 @@ from .schemas import (
     ProofreadingProposal,
     ProofreadingPublish,
     ProofreadingSessionCreate,
+    RescheduleOrderCreate,
+    RescheduleResponseInput,
     RetentionCreate,
     RetentionRelease,
+    RoomCreate,
     SegmentCreate,
 )
 
@@ -56,6 +60,26 @@ def get_db():
         conn.close()
 
 
+def require_participant_session(
+    x_session_token: Annotated[str | None, Header(alias="X-Session-Token")] = None,
+    authorization: Annotated[str | None, Header()] = None,
+    db=Depends(get_db),
+) -> dict[str, object]:
+    """Authenticate a participant via the existing demo session credential."""
+    token = x_session_token
+    if not token and authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            token = value.strip()
+    if not token:
+        raise services.ApiError(
+            401, "session_required", "A valid X-Session-Token or Bearer session token is required"
+        )
+    row = scheduling.authenticate_session(db, token)
+    return {"id": row["id"], "session_token": token, "status": row["status"]}
+
+
+Session = Annotated[dict[str, object], Depends(require_participant_session)]
 Db = Annotated[object, Depends(get_db)]
 Owner = Annotated[str, Depends(require_owner)]
 
@@ -69,6 +93,9 @@ async def lifespan(app: FastAPI):
     try:
         init_db(conn)
         app.state.startup_recovery = services.recover_unfinished(conn)
+        # Expired reschedule consultations must release their proposed slots
+        # after a restart, even if no request arrives at the deadline.
+        app.state.reschedule_recovery = scheduling.recover_rescheduling(conn)
         # At restart there is no traffic yet; flush/truncate WAL frames so
         # already-committed purges are not left in auxiliary WAL storage.
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -479,3 +506,149 @@ def publish_proofreading_session(
     owner: Owner = None,
 ):
     return proofreading.publish(db, session_id, version=body.version)
+
+
+# ---------------------------------------------------------------------------
+# Interview room booking and batch rescheduling (访谈预约 / 批量改期).
+# Owner entries manage rooms, bookings and consultations; participants use
+# their existing session token for the calendar/response entries.
+# ---------------------------------------------------------------------------
+
+
+@app.post("/owner/rooms", status_code=201)
+def create_room(body: RoomCreate, db=Depends(get_db), owner: Owner = None):
+    return scheduling.create_room(db, room_id=body.id, label=body.label)
+
+
+@app.get("/owner/rooms")
+def list_rooms(db=Depends(get_db), owner: Owner = None):
+    return {"rooms": scheduling.list_rooms(db)}
+
+
+@app.post("/owner/bookings", status_code=201)
+def create_booking(body: BookingCreate, db=Depends(get_db), owner: Owner = None):
+    return scheduling.create_booking(
+        db,
+        booking_id=body.id,
+        interview_id=body.interview_id,
+        room_id=body.room_id,
+        participant_ids=body.participant_ids,
+        start_at=body.start_at,
+        end_at=body.end_at,
+    )
+
+
+@app.get("/owner/bookings")
+def owner_list_bookings(
+    db=Depends(get_db),
+    owner: Owner = None,
+    status: str | None = Query(default=None),
+    room_id: str | None = Query(default=None),
+    interview_id: str | None = Query(default=None),
+):
+    return {
+        "bookings": scheduling.list_bookings(
+            db, status=status, room_id=room_id, interview_id=interview_id
+        )
+    }
+
+
+@app.get("/owner/bookings/{booking_id}")
+def owner_get_booking(booking_id: str, db=Depends(get_db), owner: Owner = None):
+    return scheduling.get_booking(db, booking_id)
+
+
+@app.post("/owner/bookings/{booking_id}/cancel")
+def owner_cancel_booking(
+    booking_id: str,
+    db=Depends(get_db),
+    owner: Owner = None,
+    reason: str | None = Query(default=None),
+):
+    return scheduling.cancel_booking(db, booking_id, reason=reason)
+
+
+@app.post("/owner/reschedule-orders", status_code=201)
+def create_reschedule_order(body: RescheduleOrderCreate, db=Depends(get_db), owner: Owner = None):
+    items = [
+        {
+            "booking_id": item.booking_id,
+            "room_id": item.room_id,
+            "start_at": item.start_at,
+            "end_at": item.end_at,
+        }
+        for item in body.items
+    ]
+    return scheduling.create_reschedule_order(
+        db,
+        order_id=body.id,
+        items=items,
+        consultation_deadline=body.consultation_deadline,
+    )
+
+
+@app.get("/owner/reschedule-orders")
+def owner_list_reschedule_orders(
+    db=Depends(get_db),
+    owner: Owner = None,
+    status: str | None = Query(default=None),
+):
+    return {"orders": scheduling.list_orders(db, status=status)}
+
+
+@app.get("/owner/reschedule-orders/{order_id}")
+def owner_get_reschedule_order(order_id: str, db=Depends(get_db), owner: Owner = None):
+    return scheduling.order_detail(db, order_id)
+
+
+@app.post("/owner/reschedule-orders/{order_id}/withdraw")
+def owner_withdraw_reschedule_order(order_id: str, db=Depends(get_db), owner: Owner = None):
+    return scheduling.withdraw_order(db, order_id)
+
+
+@app.post("/owner/reschedule-orders/sweep-expired")
+def owner_sweep_expired_orders(db=Depends(get_db), owner: Owner = None):
+    return scheduling.sweep_expired_orders(db)
+
+
+# --- Participant session entries -------------------------------------------
+
+
+@app.get("/me/calendar")
+def my_calendar(db=Depends(get_db), session: Session = None):
+    return scheduling.participant_calendar(db, str(session["id"]))
+
+
+@app.get("/me/reschedule-orders")
+def my_reschedule_orders(db=Depends(get_db), session: Session = None):
+    return {"orders": scheduling.list_orders(db, participant_id=str(session["id"]))}
+
+
+@app.get("/me/reschedule-orders/{order_id}")
+def my_reschedule_order(order_id: str, db=Depends(get_db), session: Session = None):
+    detail = scheduling.order_detail(db, order_id)
+    if str(session["id"]) not in detail["participant_ids"]:
+        raise services.ApiError(
+            403,
+            "not_reschedule_participant",
+            "This consultation does not involve the authenticated participant",
+        )
+    return detail
+
+
+@app.post("/me/reschedule-orders/{order_id}/responses", status_code=201)
+def respond_my_reschedule_order(
+    order_id: str,
+    body: RescheduleResponseInput,
+    db=Depends(get_db),
+    session: Session = None,
+):
+    result = scheduling.respond_to_order(
+        db,
+        order_id=order_id,
+        participant_id=str(session["id"]),
+        decision=body.decision,
+    )
+    replay = bool(result.get("idempotent_replay", False))
+    result["idempotent_replay"] = replay
+    return JSONResponse(status_code=200 if replay else 201, content=result)

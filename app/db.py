@@ -56,6 +56,22 @@ def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connecti
         raise
 
 
+@contextmanager
+def read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Open a deferred read transaction so a multi-statement query sees one
+    consistent snapshot and can never read a half-applied reschedule."""
+    conn.execute("BEGIN")
+    try:
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+
+
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 
@@ -265,6 +281,106 @@ CREATE INDEX IF NOT EXISTS idx_proofreading_annotations_session
     ON proofreading_annotations(session_id, resolved, anchored);
 CREATE INDEX IF NOT EXISTS idx_proofreading_annotations_segment
     ON proofreading_annotations(segment_id);
+
+-- ---------------------------------------------------------------------------
+-- Interview room booking and batch rescheduling (访谈预约 / 批量改期).
+--
+-- A booking binds one existing interview to a room, a fixed participant list
+-- and a UTC half-open time interval.  During a reschedule consultation the
+-- original booking rows stay confirmed; the proposed arrangement lives only in
+-- reschedule_orders/items until every affected participant accepts, at which
+-- point all new arrangements commit in one BEGIN IMMEDIATE transaction.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS rooms (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bookings (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    start_at TEXT NOT NULL,
+    end_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'confirmed'
+        CHECK (status IN ('confirmed', 'cancelled')),
+    created_by TEXT NOT NULL DEFAULT 'project-owner',
+    created_at TEXT NOT NULL,
+    cancelled_at TEXT,
+    cancellation_reason TEXT,
+    CHECK (end_at > start_at)
+);
+
+-- At most one non-cancelled booking per interview.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_one_active_per_interview
+    ON bookings(interview_id) WHERE status = 'confirmed';
+
+CREATE INDEX IF NOT EXISTS idx_bookings_room_time
+    ON bookings(room_id, start_at, end_at);
+
+CREATE TABLE IF NOT EXISTS booking_participants (
+    booking_id TEXT NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+    participant_id TEXT NOT NULL REFERENCES participants(id),
+    PRIMARY KEY (booking_id, participant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_booking_participants_participant
+    ON booking_participants(participant_id);
+
+CREATE TABLE IF NOT EXISTS reschedule_orders (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN (
+        'pending', 'approved', 'rejected', 'withdrawn', 'expired',
+        'cancelled_booking'
+    )),
+    consultation_deadline TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT 'project-owner',
+    created_at TEXT NOT NULL,
+    finalized_at TEXT,
+    end_reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_reschedule_orders_status
+    ON reschedule_orders(status, consultation_deadline);
+
+CREATE TABLE IF NOT EXISTS reschedule_items (
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES reschedule_orders(id) ON DELETE CASCADE,
+    booking_id TEXT NOT NULL REFERENCES bookings(id),
+    original_room_id TEXT NOT NULL REFERENCES rooms(id),
+    original_start_at TEXT NOT NULL,
+    original_end_at TEXT NOT NULL,
+    new_room_id TEXT NOT NULL REFERENCES rooms(id),
+    new_start_at TEXT NOT NULL,
+    new_end_at TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    CHECK (new_end_at > new_start_at),
+    UNIQUE (order_id, booking_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reschedule_items_booking
+    ON reschedule_items(booking_id);
+
+-- Application-level rule (checked inside every BEGIN IMMEDIATE transaction):
+-- a booking may belong to at most one pending consultation.  SQLite partial
+-- indexes cannot express this with a subquery, so the unique constraint is
+-- enforced in scheduling.create_reschedule_order against the serialized write
+-- lock; this ordinary index supports that lookup.
+CREATE INDEX IF NOT EXISTS idx_reschedule_items_booking_order
+    ON reschedule_items(booking_id, order_id);
+
+CREATE TABLE IF NOT EXISTS reschedule_responses (
+    order_id TEXT NOT NULL REFERENCES reschedule_orders(id) ON DELETE CASCADE,
+    participant_id TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('accepted', 'rejected')),
+    responded_at TEXT NOT NULL,
+    PRIMARY KEY (order_id, participant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reschedule_responses_participant
+    ON reschedule_responses(participant_id);
 """
 
 
