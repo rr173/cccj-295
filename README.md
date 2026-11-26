@@ -297,7 +297,7 @@ PY
 | `GET /owner/audit-events` | 查看不含正文的状态/提交审计事件 |
 | `DELETE /sessions/{token}` / `DELETE /participants/{id}/session` | 撤销账号会话；不影响已提交清除事实 |
 
-协作校稿接口见第 6 节；访谈预约与批量改期接口见第 8 节。
+协作校稿接口见第 6 节；访谈预约与批量改期接口见第 8 节；访谈补贴结算接口见第 9 节。
 
 ## 6. 协作校稿（新增）
 
@@ -410,7 +410,7 @@ cd /workspace
 
 复跑结果（本仓库当前状态）：
 
-- `pytest -q`：**58 passed**；
+- `pytest -q`：**71 passed**（含第 9 节访谈补贴结算的 13 个服务/并发测试）；
 - `scripts/e2e_proofreading.py`：**61 项检查全部通过**；
 - `scripts/e2e_demo.py`（原有功能回归）：**62 项检查全部通过**。
 
@@ -508,7 +508,127 @@ cd /workspace
 最近一次运行结果：**46 项检查全部通过**。
 
 
-## 9. 一致性设计要点
+## 9. 访谈补贴结算（新增）
+
+预约/名单只证明“谁本来要来”，不能直接作为发补贴依据。补贴模块以 `attendance_records` 的实际出席分钟数为唯一计费来源；不接入真实付款渠道，只生成交给线下付款人员的固定清单并登记线下结果。
+
+金额接口以“元”为单位（支持两位小数），数据库用整数分存储；下例均为整数元。
+
+### 9.1 计费与对账口径
+
+1. 只能为**已结束且未取消**的预约登记/更正出席；人必须在预约固定名单内，分钟数不得超过预约时长。
+2. 只有已登记出席计费：`floor(attended_minutes / 15) × 10` 元；例如 59 分钟计 30 元。
+3. 按预约 `start_at` 的 UTC 日期归入周一开始的自然周。
+4. 同一人同一周有 100 元上限；按场次开始先后逐场占用上限。更正较早场次会实时改变较晚场次当前“计入金额”。
+5. `(booking_id, participant_id)` 是主键，同一场对同一人最多一条出席计费记录，不能重复计费。
+6. 每人每周：
+   - `current_payable` / `payable_amount`：按当前出席和周上限计算的当前应付；
+   - `pending_amount` / `pending_confirmation`：已交付清单但尚未确认 `paid`/`unpaid` 的行金额；
+   - `gross_paid`：已确认付款总额；
+   - `refunded_amount`：实收退回总额；
+   - `net_paid`：`gross_paid - refunded_amount`；
+   - `sendable_amount` / `available_amount` / `now_payable`：`max(0, current_payable - net_paid - pending_amount)`，即现在可提交新批次的完整正金额；
+   - `overpaid_amount`：`max(0, net_paid - current_payable)`。
+7. 批次任一行不等于当时完整可发正金额时，整批 `409 subsidy_batch_not_full_sendable_amount`，不写入任何清单行。
+8. 成立的批次有固定 `line_no`、固定金额和批次编号；待确认行持续占用可发余额。相同请求同编号重试返回 `200 idempotent_replay=true` 和原行 ID；同编号换内容返回 `409 batch_id_reused_for_different_request`。
+9. 行结果只能是 `paid` 或 `unpaid`。同一结果重试为幂等重放，改成另一结果返回 `409 payment_result_already_recorded`。`unpaid` 释放预留，可另建新批次重发；原清单和行号仍保留。
+10. 已确认 `paid` 的行可登记退回。退回编号重试不重复入账；同编号换行/换金额返回 `409 refund_id_reused_for_different_content`；累计退回超过该行固定付款金额返回 `409 refund_amount_exceeds_line_payment`。
+11. 出席更正只改变“当前计入金额/当前应付”，不修改已交付批次行、已确认结果或退回。不同人、不同周的余额分别聚合，不互相抵扣。
+12. 个人资料清除后，内部 participant ID、出席、批次、确认和退回仍保留用于对账；这些接口不恢复资料正文、会话 token 或普通参与者入口。会话被撤销后，`/me/subsidies` 仍返回 `401`。
+
+### 9.2 HTTP 接口
+
+负责人接口仍需 `X-Owner-Token`；参与者接口使用现有 `X-Session-Token` 或 `Authorization: Bearer <token>`，且参与者 ID 只从会话解析。
+
+| 方法/路径 | 用途 |
+|---|---|
+| `PUT/POST /owner/bookings/{booking_id}/attendance` | 批量登记/更正名单内人员分钟数；体为 `{"records":[{"participant_id":"...","attended_minutes":45}]}`，也接受 `attendance`/`items`/`minutes_by_participant`；等价集合路径 `POST /owner/attendance`（体带 `booking_id`） |
+| `PUT/POST /owner/bookings/{booking_id}/attendance/{participant_id}` | 登记/更正单人分钟数：`{"attended_minutes":45}` |
+| `GET /owner/bookings/{booking_id}/attendance` | 查看名单、未登记人员、原始金额、周上限分摊后本场计入金额 |
+| `GET /owner/bookings/{booking_id}/subsidy` | 上一接口的补贴语义别名 |
+| `GET /owner/subsidies/session-entries?week_start=YYYY-MM-DD&participant_id=...` | 查看每场当前计入金额及 cap 前后余额 |
+| `GET /owner/subsidies/weeks` | 列出所有周及每人每周余额 |
+| `GET /owner/subsidies/weeks/{week_start}` | 一周余额、场次明细和批次清单；`week_start` 可传周一或该周任意日期，响应归一化为周一 |
+| `GET /owner/subsidies/balances?week_start=...&participant_id=...` | 余额查询 |
+| `GET /owner/subsidies/participants/{participant_id}/weeks/{week_start}` | 负责人按内部编号查某人某周 |
+| `POST /owner/subsidy-batches` | 创建付款批次 |
+| `POST /owner/subsidy-weeks/{week_start}/batches` | 选定一周创建批次的等价路径 |
+| `PUT/POST /owner/subsidy-batches/{batch_id}` / `.../issue` | 在路径中指定批次编号 |
+| `GET /owner/subsidy-batches?week_start=...` / `GET /owner/subsidy-batches/{batch_id}` | 查看固定清单、行状态和退回；同组路径也提供 `/owner/payment-batches`、`/owner/payout-batches` 别名 |
+| `GET /owner/subsidy-batches/{batch_id}/checklist?format=csv\|markdown\|json` | 导出可交给线下付款人员的固定行号/金额清单 |
+| `POST /owner/subsidy-batches/{batch_id}/lines/{line_no}/confirm` | 体：`{"result":"paid"}` 或 `{"result":"unpaid"}` |
+| `POST .../lines/{line_no}/confirm-paid` / `confirm-unpaid` | 不带体也可确认对应结果 |
+| `POST /owner/subsidy-lines/{line_id}/confirm` | 用内部行 ID 确认 |
+| `POST /owner/subsidy-batches/{batch_id}/lines/{line_no}/refunds` | 登记退回：`{"refund_id":"rf-1","amount":20}` |
+| `POST /owner/subsidy-lines/{line_id}/refunds` | 用内部行 ID 登记退回 |
+| `POST /owner/subsidy-refunds/{refund_id}` | 在路径指定退回编号；体给 `amount` 和 `line_id` 或 `batch_id`+`line_no`；别名 `POST /owner/refunds`、`POST /owner/refunds/{refund_id}` |
+| `GET /owner/subsidy-refunds/{refund_id}` | 查询单笔退回 |
+| `GET /me/subsidies` / `GET /me/subsidies/{week_start}` | 参与者用现有会话只看自己的结算；别名 `/me/subsidy`、`/me/subsidy-settlements`、`/me/settlements` |
+
+创建批次示例：
+
+```bash
+curl -s -X POST "$BASE/owner/subsidy-weeks/2026-11-23/batches" \
+  -H "X-Owner-Token: $PDC_OWNER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batch_id": "payout-2026w48-01",
+    "lines": [
+      {"participant_id": "p-alice", "expected_amount": 100},
+      {"participant_id": "p-bob", "expected_amount": 40}
+    ]
+  }' | python -m json.tool
+```
+
+线下人员按返回的 `lines[].line_no` 和 `amount` 付款。例如确认第 1 行已付款：
+
+```bash
+curl -s -X POST \
+  "$BASE/owner/subsidy-batches/payout-2026w48-01/lines/1/confirm-paid" \
+  -H "X-Owner-Token: $PDC_OWNER_TOKEN"
+```
+
+收到 20 元退回：
+
+```bash
+curl -s -X POST \
+  "$BASE/owner/subsidy-batches/payout-2026w48-01/lines/1/refunds" \
+  -H "X-Owner-Token: $PDC_OWNER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"refund_id":"return-001","amount":20}'
+```
+
+### 9.3 并发、持久化和复跑
+
+所有发单、确认、退回和出席更正都在单个 `BEGIN IMMEDIATE` 事务内完成“读取当前余额/状态 → 校验 → 写入”。因此：
+
+- 两个不同批次竞争同一人的同一笔可发余额时，只有一个整批成立，另一个收到 `409`，不会重复预留；
+- 同一个批次编号并发重试时，只有一个请求创建清单，其余得到同一原清单；
+- 退回编号和行结果有持久化唯一/状态检查，并发退回不会重复入账或突破行付款上限；
+- 批次主表和行表在同一事务提交，不会出现半批清单；
+- 所有清单、行结果和退回均落 SQLite，重启后可继续按原批次编号和行号确认。
+
+复跑：
+
+```bash
+cd /workspace
+
+# 服务层规则、更正跨场重分配、幂等、退回上限、资料清除、线程竞争、重开 DB
+.venv/bin/python -m pytest -q tests/test_subsidies.py
+
+# 全量回归
+.venv/bin/python -m pytest -q
+
+# 真实 uvicorn + 临时 SQLite + 真实重启的 HTTP 端到端验证
+.venv/bin/python scripts/e2e_subsidies.py
+```
+
+端到端脚本明确验证：更正较早场次引起较晚场次计入金额 `40 -> 80`、待确认期间重复发单被拒、未付款释放后另建清单、付款后更正形成多付、部分退回后的对账、资料清除后内部编号仍可发单、HTTP 并发发单以及重启后按原清单确认。
+
+本仓库当前复跑结果：`pytest -q` 为 **71 passed**（其中 `tests/test_subsidies.py` 13 项，含并发发单、同批次号竞争、并发更正、混合确认、退回上限和重开 DB）；`scripts/e2e_subsidies.py` 为 **41 项检查全部通过**。原有 `e2e_demo.py`（62 项）、`e2e_proofreading.py`（61 项）、`e2e_scheduling.py`（46 项）也已复跑通过。
+
+
+## 10. 一致性设计要点
 
 1. **普通隐藏谓词**：只要片段的任一参与者处于 `deletion_requested`，该片段就从普通 SQL 结果中排除。
 2. **执行时重读当前状态**：预览不持锁、不固化片段列表；执行事务重新查询，预览后新增且已提交的相关片段一定会进入任务。
@@ -524,5 +644,8 @@ cd /workspace
 12. **预约/改期全串行提交**：预约创建、取消、改期开单、答复、撤回和清除集成都在单个 `BEGIN IMMEDIATE` 事务内完成检查与写入；日历等多语句查询使用只读快照事务，因此任何查询都只能看到整旧或整新的安排，看不到只换了一部分的中间态。
 13. **征询期间双持有**：待答复改期单同时持有每项的原时段与拟用时段（房间维度和参与者维度），单外预约与其它待答复单都无法占用；同单项目可以复用同单将让出的时段，从而支持原时段互换。征询一旦终止（拒绝/撤回/到期/取消），拟用时段随状态翻转立即释放。
 14. **到期不靠定时器**：到期结算在每次写事务、读路径和启动恢复中惰性执行；停机期间到期的单在重启时结算为 `expired`，不会继续占用拟用时段。全员同意后的批量换档与改期单状态翻转共用同一事务提交。
+15. **补贴当前金额与已交付清单分离**：周 cap 分摊始终由当前 `attendance_records` 重算，因此更正会改变跨场计入金额；批次行金额一旦提交即固化，后续更正只通过当前应付、待确认、净实付和多付余额参与对账，绝不回写原清单。
+16. **补贴发单全串行校验**：批次创建在一个 `BEGIN IMMEDIATE` 事务内逐行核对“当前完整可发金额”，通过后同时写批次和全部行；并发批次要么整批预留成功，要么整批拒绝，不会重复预留或出现半批清单。行确认、退回累计和幂等编号也在同一串行锁内检查。
+17. **补贴义务不含正文**：补贴表只保存内部 participant ID、预约/行编号、分钟数和金额，不复制姓名、资料或片段正文；资料清除后可继续按内部编号对账，但不会恢复账号、正文或参与者会话入口。
 
 这是产品内约定的保留规则和演示级 owner token；若用于真实部署，应把 `require_owner` 替换为实际身份认证/授权，并评估 SQLite 文件层的安全删除与备份策略。

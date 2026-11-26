@@ -381,6 +381,70 @@ CREATE TABLE IF NOT EXISTS reschedule_responses (
 
 CREATE INDEX IF NOT EXISTS idx_reschedule_responses_participant
     ON reschedule_responses(participant_id);
+
+-- ---------------------------------------------------------------------------
+-- Interview attendance subsidies (访谈补贴结算).
+--
+-- Bookings remain intent records.  Only attendance_records create billable
+-- sessions.  Weekly cap allocation is computed from attendance, while issued
+-- payment-list lines freeze money that must survive later corrections.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS attendance_records (
+    booking_id TEXT NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+    participant_id TEXT NOT NULL,
+    attended_minutes INTEGER NOT NULL CHECK (attended_minutes >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (booking_id, participant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attendance_participant
+    ON attendance_records(participant_id);
+
+CREATE TABLE IF NOT EXISTS subsidy_batches (
+    id TEXT PRIMARY KEY,
+    week_start TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_subsidy_batches_week
+    ON subsidy_batches(week_start, created_at);
+
+CREATE TABLE IF NOT EXISTS subsidy_batch_lines (
+    id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL REFERENCES subsidy_batches(id) ON DELETE CASCADE,
+    line_no INTEGER NOT NULL,
+    participant_id TEXT NOT NULL,
+    week_start TEXT NOT NULL,
+    amount_fen INTEGER NOT NULL CHECK (amount_fen > 0),
+    result_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (result_status IN ('pending', 'paid', 'unpaid')),
+    confirmation_note TEXT,
+    confirmed_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (batch_id, line_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_subsidy_lines_participant_week_status
+    ON subsidy_batch_lines(participant_id, week_start, result_status);
+
+CREATE INDEX IF NOT EXISTS idx_subsidy_lines_batch
+    ON subsidy_batch_lines(batch_id, line_no);
+
+CREATE TABLE IF NOT EXISTS subsidy_refunds (
+    id TEXT PRIMARY KEY,
+    line_id TEXT NOT NULL REFERENCES subsidy_batch_lines(id) ON DELETE CASCADE,
+    amount_fen INTEGER NOT NULL CHECK (amount_fen > 0),
+    note TEXT,
+    status TEXT NOT NULL DEFAULT 'received'
+        CHECK (status IN ('received')),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_subsidy_refunds_line
+    ON subsidy_refunds(line_id);
 """
 
 

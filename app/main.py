@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 import hmac
+import io
 import os
 import sqlite3
 from contextlib import asynccontextmanager
@@ -11,9 +13,11 @@ from typing import Annotated, Literal
 from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import proofreading, scheduling, services
+from . import proofreading, scheduling, subsidies, services
 from .db import connect, init_db
 from .schemas import (
+    AttendanceMinutesInput,
+    AttendanceUpsertInput,
     BookingCreate,
     ExportCreate,
     InterviewCreate,
@@ -30,6 +34,9 @@ from .schemas import (
     RetentionRelease,
     RoomCreate,
     SegmentCreate,
+    SubsidyBatchCreate,
+    SubsidyLineConfirm,
+    SubsidyRefundCreate,
 )
 
 
@@ -611,12 +618,468 @@ def owner_sweep_expired_orders(db=Depends(get_db), owner: Owner = None):
     return scheduling.sweep_expired_orders(db)
 
 
+# ---------------------------------------------------------------------------
+# Interview attendance subsidies and offline payment reconciliation
+# ---------------------------------------------------------------------------
+
+
+def _attendance_records(body: AttendanceUpsertInput) -> list[dict]:
+    try:
+        return body.normalized_records()
+    except ValueError as exc:
+        raise services.ApiError(422, "attendance_payload_invalid", str(exc)) from exc
+
+
+@app.api_route("/owner/attendance", methods=["PUT", "POST"], status_code=200)
+def owner_upsert_attendance_collection(
+    body: AttendanceUpsertInput,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    if not body.booking_id:
+        raise services.ApiError(
+            422, "booking_id_required", "booking_id is required in the request body"
+        )
+    return subsidies.upsert_attendance(db, body.booking_id, _attendance_records(body))
+
+
+@app.api_route(
+    "/owner/bookings/{booking_id}/attendance",
+    methods=["PUT", "POST"],
+    status_code=200,
+)
+@app.api_route(
+    "/owner/attendance/{booking_id}",
+    methods=["PUT", "POST"],
+    status_code=200,
+)
+def owner_upsert_booking_attendance(
+    booking_id: str,
+    body: AttendanceUpsertInput,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    return subsidies.upsert_attendance(db, booking_id, _attendance_records(body))
+
+
+@app.api_route(
+    "/owner/bookings/{booking_id}/attendance/{participant_id}",
+    methods=["PUT", "POST"],
+    status_code=200,
+)
+def owner_upsert_participant_attendance(
+    booking_id: str,
+    participant_id: str,
+    body: AttendanceMinutesInput,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    try:
+        minutes = body.normalized_minutes()
+    except ValueError as exc:
+        raise services.ApiError(422, "attendance_payload_invalid", str(exc)) from exc
+    return subsidies.upsert_attendance(
+        db, booking_id, [{"participant_id": participant_id, "attended_minutes": minutes}]
+    )
+
+
+@app.get("/owner/bookings/{booking_id}/attendance")
+@app.get("/owner/attendance/{booking_id}")
+def owner_get_booking_attendance(booking_id: str, db=Depends(get_db), owner: Owner = None):
+    return subsidies.get_booking_attendance(db, booking_id)
+
+
+@app.get("/owner/bookings/{booking_id}/subsidy")
+def owner_get_booking_subsidy(booking_id: str, db=Depends(get_db), owner: Owner = None):
+    return subsidies.get_booking_attendance(db, booking_id)
+
+
+@app.get("/owner/subsidies/session-entries")
+@app.get("/owner/subsidies/sessions")
+def owner_subsidy_session_entries(
+    week_start: str | None = Query(default=None, alias="week"),
+    week_start_alt: str | None = Query(default=None, alias="week_start"),
+    participant_id: str | None = Query(default=None),
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    return subsidies.list_session_entries(
+        db,
+        week_start=week_start_alt or week_start,
+        participant_id=participant_id,
+    )
+
+
+@app.get("/owner/subsidies")
+@app.get("/owner/subsidies/balances")
+def owner_subsidy_balances(
+    week_start: str | None = Query(default=None, alias="week_start"),
+    week: str | None = Query(default=None),
+    participant_id: str | None = Query(default=None),
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    return subsidies.week_balances(
+        db, week_start=week_start or week, participant_id=participant_id
+    )
+
+
+@app.get("/owner/subsidies/weeks")
+def owner_subsidy_weeks(db=Depends(get_db), owner: Owner = None):
+    return subsidies.week_balances(db)
+
+
+@app.get("/owner/subsidies/weeks/{week_start}")
+def owner_subsidy_week_detail(
+    week_start: str,
+    participant_id: str | None = Query(default=None),
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    return subsidies.week_detail(db, week_start, participant_id=participant_id)
+
+
+@app.get("/owner/subsidies/participants/{participant_id}")
+def owner_participant_subsidy_all(
+    participant_id: str, db=Depends(get_db), owner: Owner = None
+):
+    return subsidies.week_balances(db, participant_id=participant_id)
+
+
+@app.get("/owner/subsidies/participants/{participant_id}/weeks/{week_start}")
+def owner_participant_subsidy_week(
+    participant_id: str,
+    week_start: str,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    return subsidies.week_detail(db, week_start, participant_id=participant_id)
+
+
+def _create_batch_response(
+    db,
+    body: SubsidyBatchCreate,
+    *,
+    path_week: str | None = None,
+    path_batch_id: str | None = None,
+    idempotency_key: str | None = None,
+):
+    try:
+        lines = body.normalized_lines()
+        week = body.normalized_week() if body.week_start else (path_week or body.path_week)
+        if not week:
+            raise ValueError("week_start is required")
+    except ValueError as exc:
+        raise services.ApiError(422, "subsidy_batch_payload_invalid", str(exc)) from exc
+    batch_id = path_batch_id or body.batch_id or idempotency_key
+    if not batch_id:
+        raise services.ApiError(422, "batch_id_required", "batch_id is required")
+    result, created = subsidies.create_batch(
+        db, batch_id=batch_id, week_start=week, lines=lines
+    )
+    return JSONResponse(status_code=201 if created else 200, content=result)
+
+
+@app.post("/owner/subsidy-batches")
+@app.post("/owner/payment-batches")
+@app.post("/owner/payout-batches")
+def owner_create_subsidy_batch(
+    body: SubsidyBatchCreate,
+    db=Depends(get_db),
+    owner: Owner = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+):
+    return _create_batch_response(db, body, idempotency_key=idempotency_key)
+
+
+@app.post("/owner/subsidy-weeks/{week_start}/batches")
+def owner_create_subsidy_batch_for_week(
+    week_start: str,
+    body: SubsidyBatchCreate,
+    db=Depends(get_db),
+    owner: Owner = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+):
+    return _create_batch_response(
+        db, body, path_week=week_start, idempotency_key=idempotency_key
+    )
+
+
+@app.put("/owner/subsidy-batches/{batch_id}")
+@app.post("/owner/subsidy-batches/{batch_id}/issue")
+def owner_issue_named_subsidy_batch(
+    batch_id: str,
+    body: SubsidyBatchCreate,
+    db=Depends(get_db),
+    owner: Owner = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+):
+    return _create_batch_response(
+        db, body, path_batch_id=batch_id, idempotency_key=idempotency_key
+    )
+
+
+@app.get("/owner/subsidy-batches")
+@app.get("/owner/payment-batches")
+@app.get("/owner/payout-batches")
+def owner_list_subsidy_batches(
+    week_start: str | None = Query(default=None, alias="week_start"),
+    week: str | None = Query(default=None),
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    return subsidies.list_batches(db, week_start=week_start or week)
+
+
+@app.get("/owner/subsidy-batches/{batch_id}")
+@app.get("/owner/payment-batches/{batch_id}")
+@app.get("/owner/payout-batches/{batch_id}")
+def owner_get_subsidy_batch(batch_id: str, db=Depends(get_db), owner: Owner = None):
+    return subsidies.get_batch(db, batch_id)
+
+
+@app.get("/owner/subsidy-batches/{batch_id}/checklist")
+def owner_get_subsidy_checklist(
+    batch_id: str,
+    format: Literal["csv", "markdown", "json"] = Query(default="csv"),
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    detail = subsidies.get_batch(db, batch_id)
+    if format == "json":
+        return detail
+
+    if format == "markdown":
+        rows = [
+            f"# Subsidy list {detail['batch_id']} (week {detail['week_start']})",
+            "",
+            "| line | participant | amount_yuan | result |",
+            "|---:|---|---:|---|",
+        ]
+        for line in detail["lines"]:
+            rows.append(
+                f"| {line['line_no']} | {line['participant_id']} | "
+                f"{line['amount']} | {line['result_status']} |"
+            )
+        return Response(content="\n".join(rows) + "\n", media_type="text/markdown; charset=utf-8")
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["batch_id", "week_start", "line_no", "participant_id", "amount_yuan", "result_status"])
+    for line in detail["lines"]:
+        writer.writerow([
+            detail["batch_id"], detail["week_start"], line["line_no"],
+            line["participant_id"], line["amount"], line["result_status"],
+        ])
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{batch_id}-checklist.csv"'},
+    )
+
+
+def _confirm_response(result: dict, created: bool):
+    return JSONResponse(status_code=201 if created else 200, content=result)
+
+
+@app.post("/owner/subsidy-batches/{batch_id}/lines/{line_no}/confirm")
+def owner_confirm_batch_line(
+    batch_id: str,
+    line_no: int,
+    body: SubsidyLineConfirm | None = None,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    if body is None:
+        raise services.ApiError(
+            422, "payment_result_required", "Provide {'result': 'paid'} or {'result': 'unpaid'}"
+        )
+    try:
+        outcome = body.normalized_result()
+    except ValueError as exc:
+        raise services.ApiError(422, "payment_result_required", str(exc)) from exc
+    note = body.note
+    payload, created = subsidies.confirm_line(
+        db, result=outcome, batch_id=batch_id, line_no=line_no, note=note
+    )
+    return _confirm_response(payload, created)
+
+
+@app.post("/owner/subsidy-batches/{batch_id}/lines/{line_no}/confirm-paid")
+def owner_confirm_batch_line_paid(
+    batch_id: str,
+    line_no: int,
+    body: SubsidyLineConfirm | None = None,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    note = body.note if body is not None else None
+    payload, created = subsidies.confirm_line(
+        db, result="paid", batch_id=batch_id, line_no=line_no, note=note
+    )
+    return _confirm_response(payload, created)
+
+
+@app.post("/owner/subsidy-batches/{batch_id}/lines/{line_no}/confirm-unpaid")
+def owner_confirm_batch_line_unpaid(
+    batch_id: str,
+    line_no: int,
+    body: SubsidyLineConfirm | None = None,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    note = body.note if body is not None else None
+    payload, created = subsidies.confirm_line(
+        db, result="unpaid", batch_id=batch_id, line_no=line_no, note=note
+    )
+    return _confirm_response(payload, created)
+
+
+@app.post("/owner/subsidy-lines/{line_id}/confirm")
+def owner_confirm_subsidy_line(
+    line_id: str,
+    body: SubsidyLineConfirm,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    outcome = body.normalized_result()
+    payload, created = subsidies.confirm_line(
+        db, result=outcome, line_id=line_id, note=body.note
+    )
+    return _confirm_response(payload, created)
+
+
+@app.post("/owner/subsidy-batches/{batch_id}/lines/{line_no}/refunds")
+def owner_refund_batch_line(
+    batch_id: str,
+    line_no: int,
+    body: SubsidyRefundCreate,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    if not body.refund_id:
+        raise services.ApiError(422, "refund_id_required", "refund_id is required")
+    if body.amount is None and body.amount_fen is None:
+        raise services.ApiError(422, "refund_amount_required", "amount is required")
+    payload, created = subsidies.register_refund(
+        db,
+        refund_id=body.refund_id,
+        amount=body.amount,
+        amount_fen=body.amount_fen,
+        batch_id=batch_id,
+        line_no=line_no,
+        note=body.note,
+    )
+    return JSONResponse(status_code=201 if created else 200, content=payload)
+
+
+@app.post("/owner/subsidy-lines/{line_id}/refunds")
+def owner_refund_subsidy_line(
+    line_id: str,
+    body: SubsidyRefundCreate,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    if not body.refund_id:
+        raise services.ApiError(422, "refund_id_required", "refund_id is required")
+    if body.amount is None and body.amount_fen is None:
+        raise services.ApiError(422, "refund_amount_required", "amount is required")
+    payload, created = subsidies.register_refund(
+        db,
+        refund_id=body.refund_id,
+        amount=body.amount,
+        amount_fen=body.amount_fen,
+        line_id=line_id,
+        note=body.note,
+    )
+    return JSONResponse(status_code=201 if created else 200, content=payload)
+
+
+@app.post("/owner/refunds")
+def owner_create_refund_in_body(
+    body: SubsidyRefundCreate,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    if not body.refund_id:
+        raise services.ApiError(422, "refund_id_required", "refund_id is required")
+    if body.amount is None and body.amount_fen is None:
+        raise services.ApiError(422, "refund_amount_required", "amount is required")
+    payload, created = subsidies.register_refund(
+        db,
+        refund_id=body.refund_id,
+        amount=body.amount,
+        amount_fen=body.amount_fen,
+        line_id=body.line_id,
+        batch_id=body.batch_id,
+        line_no=body.line_no,
+        note=body.note,
+    )
+    return JSONResponse(status_code=201 if created else 200, content=payload)
+
+
+@app.post("/owner/subsidy-refunds/{refund_id}")
+@app.post("/owner/refunds/{refund_id}")
+def owner_register_named_refund(
+    refund_id: str,
+    body: SubsidyRefundCreate,
+    db=Depends(get_db),
+    owner: Owner = None,
+):
+    if body.amount is None and body.amount_fen is None:
+        raise services.ApiError(422, "refund_amount_required", "amount is required")
+    payload, created = subsidies.register_refund(
+        db,
+        refund_id=refund_id,
+        amount=body.amount,
+        amount_fen=body.amount_fen,
+        line_id=body.line_id,
+        batch_id=body.batch_id,
+        line_no=body.line_no,
+        note=body.note,
+    )
+    return JSONResponse(status_code=201 if created else 200, content=payload)
+
+
+@app.get("/owner/subsidy-refunds/{refund_id}")
+@app.get("/owner/refunds/{refund_id}")
+def owner_get_refund(refund_id: str, db=Depends(get_db), owner: Owner = None):
+    return subsidies.get_refund(db, refund_id)
+
+
 # --- Participant session entries -------------------------------------------
 
 
 @app.get("/me/calendar")
 def my_calendar(db=Depends(get_db), session: Session = None):
     return scheduling.participant_calendar(db, str(session["id"]))
+
+
+@app.get("/me/subsidies")
+@app.get("/me/subsidy")
+@app.get("/me/subsidy-settlements")
+@app.get("/me/settlements")
+def my_subsidies(
+    week_start: str | None = Query(default=None, alias="week_start"),
+    week: str | None = Query(default=None),
+    db=Depends(get_db),
+    session: Session = None,
+):
+    return subsidies.participant_settlement(
+        db, str(session["id"]), week_start=week_start or week
+    )
+
+
+@app.get("/me/subsidies/{week_start}")
+@app.get("/me/subsidy/{week_start}")
+@app.get("/me/subsidy-settlements/{week_start}")
+@app.get("/me/settlements/{week_start}")
+def my_subsidies_for_week(
+    week_start: str,
+    db=Depends(get_db),
+    session: Session = None,
+):
+    return subsidies.participant_settlement(db, str(session["id"]), week_start=week_start)
 
 
 @app.get("/me/reschedule-orders")
